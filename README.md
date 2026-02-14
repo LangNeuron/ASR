@@ -27,10 +27,9 @@ Language support:
 - `docs/en/` - English documentation.
 - `docs/ru/` - Russian documentation.
 
-Each language directory has the same structure:
-- `research-reports/` - folders/files for experiment and research reports.
-- `code-documentation/` - technical and API/code-level documentation.
-- `theoretical-research/` - theory notes, references, and method papers summaries.
+Detailed dataset installation and downloader docs:
+- English: `docs/en/code-documentation/scripts_data_download.md`
+- Russian: `docs/ru/code-documentation/scripts_data_download.md`
 
 ## Installation
 Requirements:
@@ -57,6 +56,14 @@ poetry run ruff check .
 poetry run mypy src tests
 poetry run pytest
 ```
+
+Quick dataset download example:
+
+```bash
+bash scripts/data_download.sh --datasets all
+```
+
+Downloads all built-in datasets into `data/raw` and prints summary statistics.
 
 Start notebooks:
 

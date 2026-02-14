@@ -32,6 +32,10 @@ Each language directory has the same structure:
 - `code-documentation/` - technical and API/code-level documentation.
 - `theoretical-research/` - theory notes, references, and method papers summaries.
 
+Dataset installation and downloader details:
+- `docs/en/code-documentation/scripts_data_download.md`
+- `docs/ru/code-documentation/scripts_data_download.md`
+
 ## Installation
 Requirements:
 - Python 3.12+

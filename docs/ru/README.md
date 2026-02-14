@@ -32,6 +32,10 @@ ASR Project - рабочее пространство для создания с
 - `code-documentation/` - техническая документация по коду и API.
 - `theoretical-research/` - теоретические заметки, обзоры и материалы.
 
+Подробная документация по установке наборов данных и скрипту загрузки:
+- `docs/en/code-documentation/scripts_data_download.md`
+- `docs/ru/code-documentation/scripts_data_download.md`
+
 ## Установка
 Требования:
 - Python 3.12+
