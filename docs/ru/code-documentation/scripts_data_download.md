@@ -9,65 +9,88 @@
 Скрипт `scripts/data_download.sh` является оболочкой для `scripts/data_download.py`.
 
 ## Источники данных
-Встроенные источники:
+Встроенные скачиваемые источники:
 - Golos Opus
-- SOVA (RuDevices, публичная ссылка Yandex)
 - OpenSTT `asr_public_phone_calls_2` (архив + манифест)
 - OpenSTT `public_youtube1120` (архив + манифест)
 
-Опциональный источник (только при передаче ссылки пользователем):
-- Mozilla/Common Voice архив через `--mozilla-url`
+Опциональные источники:
+- Mozilla/Common Voice архив через `--mozilla-url` (скачивание по URL)
+- SOVA/RuDevices через `--sova-archive` (путь к локальному архиву)
+
+Для SOVA архив нужно скачать вручную отсюда:
+- `https://disk.yandex.ru/d/jz3k7pnzTpnTgw`
 
 ## Расположение данных
 Данные сохраняются в `data/raw`:
 - `data/raw/golos_opus/`
-- `data/raw/sova_rudevices/`
 - `data/raw/open_stt/asr_public_phone_calls_2/`
 - `data/raw/open_stt/public_youtube1120/`
 - `data/raw/mozilla_voice_custom/` (только если указан `--mozilla-url`)
+- `data/raw/sova_rudevices/` (только если указан `--sova-archive`)
 
 ## CLI
 ```bash
-bash scripts/data_download.sh [options]
+bash scripts/data_download.sh [command] [options]
 ```
+
+Команды:
+- `download` (по умолчанию)
+  Скачивает отсутствующие данные, проверяет уже скачанные архивы по размеру, продолжает прерванные загрузки.
+- `reinstall-all`
+  Принудительно перескачивает встроенные скачиваемые датасеты и переустанавливает опциональные входы.
 
 Аргументы:
 - `--raw-dir PATH`
   Изменить целевую директорию (по умолчанию: `data/raw`).
-- `--datasets {golos,sova,openstt_phone,openstt_youtube,all} ...`
-  Выбор встроенных наборов данных. По умолчанию: `all`.
+- `--datasets {golos,openstt_phone,openstt_youtube,all} ...`
+  Выбор встроенных скачиваемых наборов данных. По умолчанию: `all`.
 - `--mozilla-url URL`
   Опциональная пользовательская ссылка на Mozilla/Common Voice архив.
   Если параметр задан, Mozilla будет скачан, даже если его нет в `--datasets`.
-- `--sova-url URL`
-  Переопределить ссылку на SOVA.
+- `--sova-archive PATH`
+  Путь к уже скачанному локальному SOVA-архиву (`RuDevices.tar`).
 - `--no-extract`
-  Только скачать архивы, без распаковки.
+  Только скачать/скопировать архивы, без распаковки.
+
+## Политика повторных попыток
+Скрипт использует 3 уровня повторов:
+- Локальные повторы запроса: `5` попыток для отдельной передачи файла.
+- Повторы на датасет: `3` попытки на пайплайн конкретного датасета.
+- Глобальные повторы: `5` попыток на полный выбранный пайплайн загрузки.
+
+## Поведение загрузки
+- Если архив уже скачан и его локальный размер совпадает с удаленным, скачивание пропускается.
+- Если архив скачан частично, скрипт пытается продолжить загрузку через HTTP Range.
+- Если сервер не поддерживает продолжение, файл перескачивается с нуля.
+- Если на распаковке найден поврежденный архив, скрипт перескачивает архив и повторяет распаковку.
+- После успешной распаковки `.tar` / `.tar.gz` архив удаляется для экономии места.
+- Разархивированные датасеты отмечаются и автоопределяются, чтобы при повторном запуске не скачивать заново.
 
 ## Примеры
-Скачать все встроенные наборы:
+Скачать все встроенные скачиваемые наборы:
 ```bash
 bash scripts/data_download.sh
 ```
 
-Скачать только OpenSTT:
+Установить SOVA из локального архива:
 ```bash
-bash scripts/data_download.sh --datasets openstt_phone openstt_youtube
+bash scripts/data_download.sh --sova-archive /path/to/RuDevices.tar
 ```
 
-Скачать Golos и SOVA без распаковки:
+Использовать локальный SOVA + встроенные скачивания:
 ```bash
-bash scripts/data_download.sh --datasets golos sova --no-extract
+bash scripts/data_download.sh --datasets all --sova-archive /path/to/RuDevices.tar
 ```
 
-Скачать Mozilla по пользовательской ссылке дополнительно:
+Продолжить ранее прерванную загрузку:
 ```bash
-bash scripts/data_download.sh --datasets golos --mozilla-url "https://example.com/mozilla_ru.tar.gz"
+bash scripts/data_download.sh --datasets golos
 ```
 
-Изменить директорию назначения:
+Принудительно переустановить всё:
 ```bash
-bash scripts/data_download.sh --raw-dir data/custom_raw --datasets all
+bash scripts/data_download.sh reinstall-all --sova-archive /path/to/RuDevices.tar
 ```
 
 ## Подсчет длительности
@@ -80,7 +103,7 @@ bash scripts/data_download.sh --raw-dir data/custom_raw --datasets all
 Если длительность конкретного файла определить нельзя, файл учитывается как 0 секунд.
 
 ## Безопасность
-- Разрешены только URL-схемы `http`/`https`.
+- Для сетевых загрузок разрешены только URL-схемы `http`/`https`.
 - Для сетевых запросов установлен timeout.
 - В распаковке архивов есть защита от path traversal.
 - Конвертация аудиоформатов не выполняется.
@@ -91,5 +114,5 @@ bash scripts/data_download.sh --raw-dir data/custom_raw --datasets all
 
 ## Типовые проблемы
 - `Unsupported URL scheme`: используйте только `http` или `https`.
-- SOVA не скачивается: проверьте доступность публичной ссылки Yandex.
+- `Local archive not found`: проверьте путь в `--sova-archive`.
 - Мало часов в отчете: проверьте, что архивы распакованы и аудио-файлы присутствуют.

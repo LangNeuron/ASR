@@ -12,11 +12,13 @@ import subprocess
 import sys
 import tarfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import wave
 import zipfile
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from contextlib import suppress
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -42,7 +44,6 @@ except ImportError:
     SOUND_FILE = None
 
 GOLOS_URL = "https://cdn.chatwm.opensmodel.sberdevices.ru/golos/golos_opus.tar"
-SOVA_PUBLIC_URL = "https://disk.yandex.ru/d/jz3k7pnzTpnTgw"
 
 OPENSTT_PHONE_ARCHIVE = (
     "https://azureopendatastorage.blob.core.windows.net/openstt/"
@@ -65,8 +66,15 @@ AUDIO_EXTS = {".wav", ".mp3", ".flac", ".opus", ".ogg", ".m4a", ".aac", ".wma", 
 FIFTY_MB = 50 * 1024 * 1024
 URL_TIMEOUT_SECONDS = 60
 ALLOWED_URL_SCHEMES = {"http", "https"}
+REQUEST_RETRIES = 5
+DATASET_RETRIES = 3
+GLOBAL_RETRIES = 5
+EXTRACT_REPAIR_RETRIES = 2
+RETRY_SLEEP_SECONDS = 3
 DatasetStats = tuple[str, int, float]
 DatasetTargets = tuple[str, Path, Path | None]
+BUILTIN_DATASETS = {"golos", "openstt_phone", "openstt_youtube"}
+INSTALL_MARKER_NAME = ".asr_dataset_installed.json"
 
 
 def log(msg: str) -> None:
@@ -93,56 +101,224 @@ def validate_download_url(url: str) -> str:
     return url
 
 
-def download_file(url: str, destination: Path) -> Path:
-    """Download URL content to destination with progress logs."""
+def _parse_int_header(value: str | None) -> int | None:
+    """Parse integer HTTP header value."""
+    if value is None or not value.isdigit():
+        return None
+    return int(value)
+
+
+def _parse_content_range_total(value: str | None) -> int | None:
+    """Extract total size from Content-Range header."""
+    if value is None or "/" not in value:
+        return None
+    total_part = value.rsplit("/", maxsplit=1)[-1].strip()
+    if total_part == "*" or not total_part.isdigit():
+        return None
+    return int(total_part)
+
+
+def get_remote_size(url: str) -> int | None:
+    """Try to get remote file size through HTTP HEAD request."""
+    safe_url = validate_download_url(url)
+    request_headers = {"User-Agent": "ASRDownloader/1.0"}
+    req = urllib.request.Request(safe_url, headers=request_headers, method="HEAD")  # noqa: S310
+    try:
+        with urllib.request.urlopen(req, timeout=URL_TIMEOUT_SECONDS) as response:  # noqa: S310
+            return _parse_int_header(response.headers.get("Content-Length"))
+    except (OSError, TimeoutError, urllib.error.URLError, urllib.error.HTTPError):
+        return None
+
+
+def download_file(url: str, destination: Path, force_redownload: bool = False) -> Path:
+    """Download URL content to destination with resume support and progress logs."""
     safe_url = validate_download_url(url)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    request_headers = {"User-Agent": "ASRDownloader/1.0"}
-    req = urllib.request.Request(safe_url, headers=request_headers)  # noqa: S310
-    with urllib.request.urlopen(req, timeout=URL_TIMEOUT_SECONDS) as response:  # noqa: S310
-        total_str = response.headers.get("Content-Length")
-        total = int(total_str) if total_str and total_str.isdigit() else None
-        downloaded = 0
-        chunk_size = 1024 * 1024
-        next_report = 0
-        with destination.open("wb") as out:
-            while True:
-                chunk = response.read(chunk_size)
-                if not chunk:
-                    break
-                out.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    percent = int(downloaded * 100 / total)
-                    if percent >= next_report:
-                        log(
-                            f"Downloading {destination.name}: {percent}% "
-                            f"({format_size(downloaded)} / {format_size(total)})"
-                        )
-                        next_report += 5
-                elif downloaded // FIFTY_MB > (downloaded - len(chunk)) // FIFTY_MB:
-                    log(f"Downloading {destination.name}: {format_size(downloaded)}")
-    log(f"Saved: {destination}")
-    return destination
+    remote_size = get_remote_size(safe_url)
+
+    if force_redownload:
+        _safe_remove_file(destination)
+
+    if destination.exists():
+        local_size = destination.stat().st_size
+        if remote_size is not None and local_size == remote_size:
+            log(
+                f"Already downloaded {destination.name}: "
+                f"{format_size(local_size)} (size verified)"
+            )
+            return destination
+        if remote_size is not None and local_size > remote_size:
+            log(
+                f"Local file is larger than remote for {destination.name}. "
+                "Re-downloading from scratch."
+            )
+            _safe_remove_file(destination)
+
+    start_offset = destination.stat().st_size if destination.exists() else 0
+    use_range = start_offset > 0
+
+    for _ in range(2):
+        request_headers = {"User-Agent": "ASRDownloader/1.0"}
+        if use_range:
+            request_headers["Range"] = f"bytes={start_offset}-"
+
+        req = urllib.request.Request(safe_url, headers=request_headers)  # noqa: S310
+        with urllib.request.urlopen(req, timeout=URL_TIMEOUT_SECONDS) as response:  # noqa: S310
+            status_code = int(getattr(response, "status", 200))
+            if use_range and status_code != 206:
+                log(
+                    f"Server did not honor resume for {destination.name}; "
+                    "restarting from 0."
+                )
+                _safe_remove_file(destination)
+                start_offset = 0
+                use_range = False
+                continue
+
+            content_length = _parse_int_header(response.headers.get("Content-Length"))
+            content_range = response.headers.get("Content-Range")
+
+            if status_code == 206:
+                total = _parse_content_range_total(content_range)
+                if total is None and content_length is not None:
+                    total = start_offset + content_length
+                mode = "ab"
+                downloaded = start_offset
+            else:
+                total = remote_size if remote_size is not None else content_length
+                mode = "wb"
+                downloaded = 0
+
+            chunk_size = 1024 * 1024
+            next_report = int(downloaded * 100 / total) if total else 0
+            with destination.open(mode) as out:
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        percent = int(downloaded * 100 / total)
+                        if percent >= next_report:
+                            log(
+                                f"Downloading {destination.name}: {percent}% "
+                                f"({format_size(downloaded)} / {format_size(total)})"
+                            )
+                            next_report += 5
+                    elif downloaded // FIFTY_MB > (downloaded - len(chunk)) // FIFTY_MB:
+                        log(f"Downloading {destination.name}: {format_size(downloaded)}")
+
+            if total is not None and downloaded < total:
+                raise RuntimeError(
+                    f"Incomplete download for {destination.name}: "
+                    f"{format_size(downloaded)} of {format_size(total)}"
+                )
+
+            log(f"Saved: {destination}")
+            return destination
+
+    raise RuntimeError(f"Failed to download {destination.name}: unable to complete transfer")
 
 
-def get_yandex_direct_url(public_url: str) -> str:
-    """Resolve a Yandex public link into a direct download URL."""
-    validate_download_url(public_url)
-    api = (
-        "https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key="
-        f"{urllib.parse.quote(public_url, safe='')}"
+def _safe_remove_file(path: Path) -> None:
+    """Remove file if it exists."""
+    with suppress(OSError):
+        path.unlink(missing_ok=True)
+
+
+def _install_marker_path(dataset_dir: Path) -> Path:
+    """Return marker file path used to track extracted datasets."""
+    return dataset_dir / INSTALL_MARKER_NAME
+
+
+def _write_install_marker(dataset_dir: Path, source_url: str) -> None:
+    """Write dataset installation marker after successful extraction."""
+    marker = _install_marker_path(dataset_dir)
+    payload = {
+        "installed": True,
+        "source_url": source_url,
+        "created_at_unix": int(time.time()),
+    }
+    marker.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
+
+def _has_extracted_content(dataset_dir: Path) -> bool:
+    """Check whether dataset directory already contains extracted content."""
+    if not dataset_dir.exists():
+        return False
+    for entry in dataset_dir.iterdir():
+        if entry.name in {"downloads", INSTALL_MARKER_NAME}:
+            continue
+        return True
+    return False
+
+
+def is_dataset_installed(dataset_dir: Path) -> bool:
+    """Return True when dataset appears extracted and ready to use."""
+    marker = _install_marker_path(dataset_dir)
+    if marker.exists() and _has_extracted_content(dataset_dir):
+        return True
+
+    # Backward-compatible auto-detection for datasets extracted before markers were introduced.
+    if _has_extracted_content(dataset_dir):
+        _write_install_marker(dataset_dir, source_url="auto-detected")
+        return True
+
+    return False
+
+
+def cleanup_dataset_for_reinstall(dataset_dir: Path) -> None:
+    """Delete dataset directory to enforce clean reinstall."""
+    if dataset_dir.exists():
+        log(f"Reinstall mode: removing existing dataset directory {dataset_dir}")
+        shutil.rmtree(dataset_dir, ignore_errors=True)
+
+
+def _should_remove_archive_after_extract(archive_path: Path) -> bool:
+    """Return True if extracted archive should be removed to save disk space."""
+    suffixes = "".join(archive_path.suffixes).lower()
+    return suffixes.endswith(".tar") or suffixes.endswith(".tar.gz") or suffixes.endswith(".tgz")
+
+
+def download_file_with_retries(
+    url: str,
+    destination: Path,
+    max_attempts: int = REQUEST_RETRIES,
+    force_redownload: bool = False,
+) -> Path:
+    """Download with request-level retries."""
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return download_file(url, destination, force_redownload=force_redownload)
+        except urllib.error.HTTPError as error:
+            last_error = error
+            if error.code in {401, 403, 413, 416}:
+                _safe_remove_file(destination)
+            if attempt < max_attempts:
+                log(
+                    f"Download failed ({attempt}/{max_attempts}) for {destination.name}: {error}. "
+                    f"Retrying in {RETRY_SLEEP_SECONDS}s..."
+                )
+                time.sleep(RETRY_SLEEP_SECONDS)
+            else:
+                break
+        except (RuntimeError, TimeoutError, OSError, urllib.error.URLError) as error:
+            last_error = error
+            if attempt < max_attempts:
+                log(
+                    f"Download failed ({attempt}/{max_attempts}) for {destination.name}: {error}. "
+                    f"Retrying in {RETRY_SLEEP_SECONDS}s..."
+                )
+                time.sleep(RETRY_SLEEP_SECONDS)
+            else:
+                break
+
+    raise RuntimeError(
+        f"Failed to download {destination.name} after {max_attempts} attempts: "
+        f"{last_error}"
     )
-    request_headers = {"User-Agent": "ASRDownloader/1.0"}
-    req = urllib.request.Request(api, headers=request_headers)  # noqa: S310
-    with urllib.request.urlopen(req, timeout=URL_TIMEOUT_SECONDS) as response:  # noqa: S310
-        payload = json.loads(response.read().decode("utf-8"))
-    if not isinstance(payload, dict):
-        raise RuntimeError("Yandex Disk API returned invalid JSON payload.")
-    href = payload.get("href")
-    if not isinstance(href, str) or not href:
-        raise RuntimeError(f"Yandex Disk API did not return 'href': {payload}")
-    return href
 
 
 def _resolve_safe_target(base: Path, candidate: Path) -> Path:
@@ -331,39 +507,143 @@ def maybe_extract(archive_path: Path, target_dir: Path, extract_enabled: bool) -
         log(f"Extraction disabled, archive kept: {archive_path}")
 
 
-def download_mozilla(raw_dir: Path, extract_enabled: bool, mozilla_url: str) -> Path:
+def maybe_extract_with_repair(
+    archive_url: str,
+    archive_path: Path,
+    target_dir: Path,
+    extract_enabled: bool,
+    max_attempts: int = EXTRACT_REPAIR_RETRIES,
+) -> None:
+    """Extract archive and repair by re-downloading if archive is corrupted."""
+    if not extract_enabled:
+        log(f"Extraction disabled, archive kept: {archive_path}")
+        return
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            extract_archive(archive_path, target_dir)
+            _write_install_marker(target_dir, source_url=archive_url)
+            if _should_remove_archive_after_extract(archive_path):
+                _safe_remove_file(archive_path)
+                log(f"Removed archive after extraction: {archive_path}")
+            return
+        except (tarfile.ReadError, zipfile.BadZipFile, EOFError, OSError) as error:
+            if attempt >= max_attempts:
+                raise RuntimeError(
+                    f"Failed to extract archive {archive_path} after {max_attempts} attempts: "
+                    f"{error}"
+                ) from error
+            log(
+                f"Archive appears corrupted ({archive_path.name}): {error}. "
+                "Re-downloading archive and retrying extraction..."
+            )
+            _safe_remove_file(archive_path)
+            download_file_with_retries(archive_url, archive_path, force_redownload=True)
+
+
+def run_dataset_with_retries(
+    dataset_name: str,
+    operation: Callable[[], DatasetTargets],
+    max_attempts: int = DATASET_RETRIES,
+) -> DatasetTargets:
+    """Run dataset download/extract with dataset-level retries."""
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return operation()
+        except RuntimeError as error:
+            last_error = error
+            if attempt < max_attempts:
+                log(
+                    f"Dataset {dataset_name} failed ({attempt}/{max_attempts}): {error}. "
+                    f"Retrying dataset in {RETRY_SLEEP_SECONDS}s..."
+                )
+                time.sleep(RETRY_SLEEP_SECONDS)
+            else:
+                break
+    raise RuntimeError(
+        f"Dataset {dataset_name} failed after {max_attempts} attempts: {last_error}"
+    )
+
+
+def download_mozilla(
+    raw_dir: Path,
+    extract_enabled: bool,
+    mozilla_url: str,
+    force_redownload: bool = False,
+) -> Path:
     """Download and optionally extract Mozilla dataset from a custom URL."""
     dataset_dir = raw_dir / "mozilla_voice_custom"
+    if force_redownload:
+        cleanup_dataset_for_reinstall(dataset_dir)
+    if extract_enabled and not force_redownload and is_dataset_installed(dataset_dir):
+        log(f"Dataset already extracted and ready: {dataset_dir}. Skipping download.")
+        return dataset_dir
+
     downloads = dataset_dir / "downloads"
     archive = downloads / Path(urllib.parse.urlparse(mozilla_url).path).name
     log("Start download: Mozilla Voice RU")
-    download_file(mozilla_url, archive)
-    maybe_extract(archive, dataset_dir, extract_enabled)
+    download_file_with_retries(mozilla_url, archive, force_redownload=force_redownload)
+    maybe_extract_with_repair(mozilla_url, archive, dataset_dir, extract_enabled)
     return dataset_dir
 
 
-def download_golos(raw_dir: Path, extract_enabled: bool) -> Path:
+def download_golos(raw_dir: Path, extract_enabled: bool, force_redownload: bool = False) -> Path:
     """Download and optionally extract Golos Opus dataset."""
     dataset_dir = raw_dir / "golos_opus"
+    if force_redownload:
+        cleanup_dataset_for_reinstall(dataset_dir)
+    if extract_enabled and not force_redownload and is_dataset_installed(dataset_dir):
+        log(f"Dataset already extracted and ready: {dataset_dir}. Skipping download.")
+        return dataset_dir
+
     downloads = dataset_dir / "downloads"
     archive = downloads / "golos_opus.tar"
     log("Start download: Golos Opus")
-    download_file(GOLOS_URL, archive)
-    maybe_extract(archive, dataset_dir, extract_enabled)
+    download_file_with_retries(GOLOS_URL, archive, force_redownload=force_redownload)
+    maybe_extract_with_repair(GOLOS_URL, archive, dataset_dir, extract_enabled)
     return dataset_dir
 
 
-def download_sova(raw_dir: Path, extract_enabled: bool, sova_public_url: str) -> Path:
-    """Download and optionally extract SOVA dataset from Yandex public link."""
-    dataset_dir = raw_dir / "sova_rudevices"
+def extract_local_archive_for_dataset(
+    raw_dir: Path,
+    dataset_name: str,
+    archive_path_str: str,
+    extract_enabled: bool,
+    force_redownload: bool = False,
+) -> Path:
+    """Use local archive for dataset extraction and tracking."""
+    source_archive = Path(archive_path_str).expanduser().resolve()
+    if not source_archive.exists() or not source_archive.is_file():
+        raise RuntimeError(f"Local archive not found: {source_archive}")
+
+    dataset_dir = raw_dir / dataset_name
+    if force_redownload:
+        cleanup_dataset_for_reinstall(dataset_dir)
+    if extract_enabled and not force_redownload and is_dataset_installed(dataset_dir):
+        log(f"Dataset already extracted and ready: {dataset_dir}. Skipping download.")
+        return dataset_dir
+
     downloads = dataset_dir / "downloads"
     downloads.mkdir(parents=True, exist_ok=True)
-    log("Start download: SOVA (RuDevices) via Yandex Disk public link")
-    direct_url = get_yandex_direct_url(sova_public_url)
-    archive_name = Path(urllib.parse.urlparse(direct_url).path).name or "sova_dataset.bin"
-    archive = downloads / archive_name
-    download_file(direct_url, archive)
-    maybe_extract(archive, dataset_dir, extract_enabled)
+
+    archive = downloads / source_archive.name
+    source_size = source_archive.stat().st_size
+    if not archive.exists() or archive.stat().st_size != source_size:
+        log(f"Copy local archive for {dataset_name}: {source_archive} -> {archive}")
+        shutil.copy2(source_archive, archive)
+    else:
+        log(f"Local archive already prepared for {dataset_name}: {archive}")
+
+    if extract_enabled:
+        extract_archive(archive, dataset_dir)
+        _write_install_marker(dataset_dir, source_url=f"local-archive:{source_archive}")
+        if _should_remove_archive_after_extract(archive):
+            _safe_remove_file(archive)
+            log(f"Removed archive after extraction: {archive}")
+    else:
+        log(f"Extraction disabled, archive kept: {archive}")
+
     return dataset_dir
 
 
@@ -373,21 +653,31 @@ def download_openstt_subset(
     archive_url: str,
     manifest_url: str,
     extract_enabled: bool,
+    force_redownload: bool = False,
 ) -> tuple[Path, Path]:
     """Download OpenSTT subset archive and manifest; optionally extract archive."""
     dataset_dir = raw_dir / "open_stt" / subset_name
+    if force_redownload:
+        cleanup_dataset_for_reinstall(dataset_dir)
+
     downloads = dataset_dir / "downloads"
     downloads.mkdir(parents=True, exist_ok=True)
 
     archive = downloads / Path(urllib.parse.urlparse(archive_url).path).name
     manifest = dataset_dir / Path(urllib.parse.urlparse(manifest_url).path).name
 
-    log(f"Start download: OpenSTT {subset_name} archive")
-    download_file(archive_url, archive)
-    log(f"Start download: OpenSTT {subset_name} manifest")
-    download_file(manifest_url, manifest)
+    if extract_enabled and not force_redownload and is_dataset_installed(dataset_dir):
+        log(f"Dataset already extracted and ready: {dataset_dir}. Skipping download.")
+        if not manifest.exists():
+            download_file_with_retries(manifest_url, manifest)
+        return dataset_dir, manifest
 
-    maybe_extract(archive, dataset_dir, extract_enabled)
+    log(f"Start download: OpenSTT {subset_name} archive")
+    download_file_with_retries(archive_url, archive, force_redownload=force_redownload)
+    log(f"Start download: OpenSTT {subset_name} manifest")
+    download_file_with_retries(manifest_url, manifest, force_redownload=force_redownload)
+
+    maybe_extract_with_repair(archive_url, archive, dataset_dir, extract_enabled)
     return dataset_dir, manifest
 
 
@@ -399,13 +689,19 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
             "(audio files + hours)."
         )
     )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="download",
+        choices=["download", "reinstall-all"],
+        help="`download` keeps existing valid archives; `reinstall-all` forces full re-download.",
+    )
     parser.add_argument("--raw-dir", default="data/raw", help="Target raw data directory")
     parser.add_argument(
         "--datasets",
         nargs="+",
         choices=[
             "golos",
-            "sova",
             "openstt_phone",
             "openstt_youtube",
             "all",
@@ -418,7 +714,11 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         default="",
         help="Custom Mozilla archive URL (downloaded only if provided)",
     )
-    parser.add_argument("--sova-url", default=SOVA_PUBLIC_URL, help="SOVA public URL (Yandex Disk)")
+    parser.add_argument(
+        "--sova-archive",
+        default="",
+        help="Path to already downloaded SOVA archive (RuDevices.tar)",
+    )
     parser.add_argument(
         "--no-extract",
         action="store_true",
@@ -427,50 +727,100 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     return parser.parse_args(list(argv))
 
 
-def normalize_selected(datasets: list[str]) -> set[str]:
-    """Normalize dataset selection handling the 'all' alias."""
-    if "all" in datasets:
-        return {"golos", "sova", "openstt_phone", "openstt_youtube"}
+def normalize_selected(datasets: list[str], reinstall_all: bool) -> set[str]:
+    """Normalize dataset selection handling the 'all' alias and reinstall mode."""
+    if reinstall_all or "all" in datasets:
+        return set(BUILTIN_DATASETS)
     return set(datasets)
 
 
 def resolve_targets(
-    selected: set[str], args: argparse.Namespace, raw_dir: Path, extract_enabled: bool
+    selected: set[str],
+    args: argparse.Namespace,
+    raw_dir: Path,
+    extract_enabled: bool,
+    force_redownload: bool,
 ) -> list[DatasetTargets]:
     """Download selected datasets and return roots/manifests for summarization."""
     targets: list[DatasetTargets] = []
     if args.mozilla_url:
         targets.append(
-            (
+            run_dataset_with_retries(
                 "mozilla_voice_custom",
-                download_mozilla(raw_dir, extract_enabled, args.mozilla_url),
-                None,
+                lambda: (
+                    "mozilla_voice_custom",
+                    download_mozilla(
+                        raw_dir,
+                        extract_enabled,
+                        args.mozilla_url,
+                        force_redownload=force_redownload,
+                    ),
+                    None,
+                ),
             )
         )
     if "golos" in selected:
-        targets.append(("golos_opus", download_golos(raw_dir, extract_enabled), None))
-    if "sova" in selected:
         targets.append(
-            ("sova_rudevices", download_sova(raw_dir, extract_enabled, args.sova_url), None)
+            run_dataset_with_retries(
+                "golos_opus",
+                lambda: (
+                    "golos_opus",
+                    download_golos(
+                        raw_dir, extract_enabled, force_redownload=force_redownload
+                    ),
+                    None,
+                ),
+            )
+        )
+    if args.sova_archive:
+        targets.append(
+            run_dataset_with_retries(
+                "sova_rudevices",
+                lambda: (
+                    "sova_rudevices",
+                    extract_local_archive_for_dataset(
+                        raw_dir,
+                        "sova_rudevices",
+                        args.sova_archive,
+                        extract_enabled,
+                        force_redownload=force_redownload,
+                    ),
+                    None,
+                ),
+            )
         )
     if "openstt_phone" in selected:
-        openstt_phone = download_openstt_subset(
-            raw_dir,
-            "asr_public_phone_calls_2",
-            OPENSTT_PHONE_ARCHIVE,
-            OPENSTT_PHONE_MANIFEST,
-            extract_enabled,
+        openstt_phone = run_dataset_with_retries(
+            "openstt_phone_calls_2",
+            lambda: (
+                "openstt_phone_calls_2",
+                *download_openstt_subset(
+                    raw_dir,
+                    "asr_public_phone_calls_2",
+                    OPENSTT_PHONE_ARCHIVE,
+                    OPENSTT_PHONE_MANIFEST,
+                    extract_enabled,
+                    force_redownload=force_redownload,
+                ),
+            ),
         )
-        targets.append(("openstt_phone_calls_2", openstt_phone[0], openstt_phone[1]))
+        targets.append(openstt_phone)
     if "openstt_youtube" in selected:
-        openstt_youtube = download_openstt_subset(
-            raw_dir,
-            "public_youtube1120",
-            OPENSTT_YT_ARCHIVE,
-            OPENSTT_YT_MANIFEST,
-            extract_enabled,
+        openstt_youtube = run_dataset_with_retries(
+            "openstt_public_youtube1120",
+            lambda: (
+                "openstt_public_youtube1120",
+                *download_openstt_subset(
+                    raw_dir,
+                    "public_youtube1120",
+                    OPENSTT_YT_ARCHIVE,
+                    OPENSTT_YT_MANIFEST,
+                    extract_enabled,
+                    force_redownload=force_redownload,
+                ),
+            ),
         )
-        targets.append(("openstt_public_youtube1120", openstt_youtube[0], openstt_youtube[1]))
+        targets.append(openstt_youtube)
     return targets
 
 
@@ -500,16 +850,40 @@ def print_summary(stats: list[DatasetStats]) -> None:
 def main(argv: Iterable[str]) -> int:
     """Entry point for dataset downloader CLI."""
     args = parse_args(argv)
-    selected = normalize_selected(args.datasets)
+    force_redownload = args.command == "reinstall-all"
+    selected = normalize_selected(args.datasets, force_redownload)
     raw_dir = Path(args.raw_dir)
     extract_enabled = not args.no_extract
 
     raw_dir.mkdir(parents=True, exist_ok=True)
     log(f"Target raw directory: {raw_dir.resolve()}")
     log(f"Selected datasets: {', '.join(sorted(selected))}")
+    if force_redownload:
+        log("Mode: reinstall-all (forcing re-download of selected datasets)")
 
-    targets = resolve_targets(selected, args, raw_dir, extract_enabled)
-    stats = summarize_targets(targets)
+    stats: list[DatasetStats] = []
+    for attempt in range(1, GLOBAL_RETRIES + 1):
+        try:
+            targets = resolve_targets(
+                selected,
+                args,
+                raw_dir,
+                extract_enabled,
+                force_redownload=force_redownload,
+            )
+            stats = summarize_targets(targets)
+            break
+        except RuntimeError as error:
+            if attempt < GLOBAL_RETRIES:
+                log(
+                    f"Global download failed ({attempt}/{GLOBAL_RETRIES}): {error}. "
+                    f"Retrying full pipeline in {RETRY_SLEEP_SECONDS}s..."
+                )
+                time.sleep(RETRY_SLEEP_SECONDS)
+            else:
+                raise RuntimeError(
+                    f"Download pipeline failed after {GLOBAL_RETRIES} global attempts: {error}"
+                ) from error
 
     if not stats:
         log("No datasets selected. Nothing to do.")

@@ -63,7 +63,31 @@ Quick dataset download example:
 bash scripts/data_download.sh --datasets all
 ```
 
-Downloads all built-in datasets into `data/raw` and prints summary statistics.
+Install SOVA from local pre-downloaded archive:
+
+```bash
+bash scripts/data_download.sh --sova-archive /path/to/RuDevices.tar
+```
+
+Source for manual SOVA archive download:
+- `https://disk.yandex.ru/d/jz3k7pnzTpnTgw`
+
+Resume interrupted or verify existing dataset downloads:
+
+```bash
+bash scripts/data_download.sh --datasets golos
+```
+
+Force full re-download of built-in downloadable datasets:
+
+```bash
+bash scripts/data_download.sh reinstall-all
+```
+
+Retry policy overview:
+- request-level retries: `5`
+- dataset-level retries: `3`
+- global pipeline retries: `5`
 
 Start notebooks:
 
